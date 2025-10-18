@@ -39,15 +39,22 @@ class ArVideoRenderer(private val context: Context) {
             }
         """
         
-        // Fragment shader - External texture (for video)
+        // Fragment shader - External texture (for video) with debug color
         private const val FRAGMENT_SHADER = """
             #extension GL_OES_EGL_image_external : require
             precision mediump float;
             varying vec2 v_TexCoord;
             uniform samplerExternalOES u_Texture;
+            uniform float u_VideoReady;
             
             void main() {
-                gl_FragColor = texture2D(u_Texture, v_TexCoord);
+                if (u_VideoReady > 0.5) {
+                    // Video is ready - render texture
+                    gl_FragColor = texture2D(u_Texture, v_TexCoord);
+                } else {
+                    // Video not ready - show BRIGHT GREEN debug color (impossible to miss!)
+                    gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0);
+                }
             }
         """
         
@@ -78,6 +85,7 @@ class ArVideoRenderer(private val context: Context) {
     private var texCoordAttribute = 0
     private var modelViewProjectionUniform = 0
     private var textureUniform = 0
+    private var videoReadyUniform = 0
     
     // Buffers
     private var vertexBuffer: FloatBuffer
@@ -99,6 +107,7 @@ class ArVideoRenderer(private val context: Context) {
     private var isInitialized = false
     private var isPlaying: Boolean = false
     private var glResourcesInitialized = false
+    private var frameCount = 0
 
     private val mainThreadHandler = Handler(Looper.getMainLooper())
     
@@ -156,6 +165,7 @@ class ArVideoRenderer(private val context: Context) {
             // Get uniform locations
             modelViewProjectionUniform = GLES20.glGetUniformLocation(shaderProgram, "u_ModelViewProjection")
             textureUniform = GLES20.glGetUniformLocation(shaderProgram, "u_Texture")
+            videoReadyUniform = GLES20.glGetUniformLocation(shaderProgram, "u_VideoReady")
             
             // Create external texture for video
             val textures = IntArray(1)
@@ -168,8 +178,8 @@ class ArVideoRenderer(private val context: Context) {
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
             GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
             
-            Log.d(TAG, "OpenGL initialized successfully")
             glResourcesInitialized = true
+            Log.i(TAG, "✅ OpenGL initialized - Program: $shaderProgram, Texture: $textureId")
             
         } catch (e: Exception) {
             Log.e(TAG, "Error initializing OpenGL: ${e.message}", e)
@@ -177,13 +187,11 @@ class ArVideoRenderer(private val context: Context) {
     }
     
     /**
-     * Check OpenGL errors
+     * Check OpenGL errors (silent - no log spam)
      */
     private fun checkGlError(op: String) {
-        val error = GLES20.glGetError()
-        if (error != GLES20.GL_NO_ERROR) {
-            Log.e(TAG, "OpenGL error after $op: 0x${Integer.toHexString(error)}")
-        }
+        // Silent check - errors will show up in critical paths only
+        GLES20.glGetError()
     }
     
     /**
@@ -217,11 +225,15 @@ class ArVideoRenderer(private val context: Context) {
         onVideoPrepared: (() -> Unit)? = null,
         onVideoError: ((Throwable) -> Unit)? = null
     ): Boolean {
+        Log.i(TAG, "📹 initializeVideo START")
+        Log.i(TAG, "  - videoPath: $videoPath")
+        Log.i(TAG, "  - width: $width")
+        Log.i(TAG, "  - glResourcesInitialized: $glResourcesInitialized")
+        Log.i(TAG, "  - textureId: $textureId")
+        
         try {
-            Log.d(TAG, "Initializing video at anchor: $videoPath")
-            
-            if (!glResourcesInitialized || textureId == 0) {
-                Log.e(TAG, "OpenGL resources not initialized before initializeVideo")
+            if (!glResourcesInitialized) {
+                Log.e(TAG, "❌ OpenGL not ready - glResourcesInitialized=$glResourcesInitialized")
                 return false
             }
 
@@ -229,7 +241,12 @@ class ArVideoRenderer(private val context: Context) {
             this.anchor = anchor
             this.videoWidth = width
             
+            // Set initialized immediately so we can see green plane
+            isInitialized = true
+            Log.i(TAG, "✅ isInitialized set to TRUE - green plane should appear!")
+            
             // Create SurfaceTexture from OpenGL texture
+            Log.i(TAG, "🎨 Creating SurfaceTexture with textureId: $textureId")
             surfaceTexture?.release()
             surface?.release()
 
@@ -238,12 +255,17 @@ class ArVideoRenderer(private val context: Context) {
                     // Video frame available - will be handled in draw()
                 }
             }
+            Log.i(TAG, "✓ SurfaceTexture created")
 
             surface = Surface(surfaceTexture)
+            Log.i(TAG, "✓ Surface created")
             
             // Create and setup MediaPlayer
+            Log.i(TAG, "🎵 Scheduling MediaPlayer setup on main thread...")
             mainThreadHandler.post {
                 try {
+                    Log.i(TAG, "🎬 MediaPlayer setup starting...")
+                    
                     mediaPlayer?.let {
                         try {
                             if (it.isPlaying) it.stop()
@@ -254,16 +276,20 @@ class ArVideoRenderer(private val context: Context) {
 
                     mediaPlayer = MediaPlayer().apply {
                         val flutterAssetPath = "flutter_assets/$videoPath"
-                        Log.d(TAG, "Loading from asset path: $flutterAssetPath")
+                        Log.i(TAG, "📂 Loading video from: $flutterAssetPath")
 
                         val afd = context.assets.openFd(flutterAssetPath)
                         setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
                         afd.close()
+                        Log.i(TAG, "✓ DataSource set")
 
                         // Set surface
                         setSurface(surface)
+                        Log.i(TAG, "✓ Surface attached to MediaPlayer")
 
                         setOnPreparedListener { mp ->
+                            Log.i(TAG, "🎉 MediaPlayer PREPARED callback!")
+                            
                             // Get video dimensions
                             val vWidth = mp.videoWidth
                             val vHeight = mp.videoHeight
@@ -272,33 +298,31 @@ class ArVideoRenderer(private val context: Context) {
                             // Calculate proper video plane height based on width (in METERS, not pixels!)
                             this@ArVideoRenderer.videoHeight = this@ArVideoRenderer.videoWidth / aspectRatio
 
-                            Log.d(TAG, "Video prepared - ${vWidth}x${vHeight} pixels, aspect ratio: $aspectRatio")
-                            Log.d(TAG, "Video plane size: ${this@ArVideoRenderer.videoWidth}m x ${this@ArVideoRenderer.videoHeight}m")
-
                             // Start playback
                             mp.start()
                             this@ArVideoRenderer.isPlaying = true
-                            Log.d(TAG, "Video playback started")
+                            Log.i(TAG, "▶️▶️▶️ Video PLAYING! Size: ${vWidth}x${vHeight}, aspect: $aspectRatio")
                             onVideoPrepared?.invoke()
                         }
 
                         setOnErrorListener { _, what, extra ->
                             val error = RuntimeException("MediaPlayer error: what=$what, extra=$extra")
-                            Log.e(TAG, error.message ?: "MediaPlayer error")
+                            Log.e(TAG, "❌ ${error.message}")
                             onVideoError?.invoke(error)
                             true
                         }
 
                         setLooping(true)
+                        Log.i(TAG, "📞 Calling prepareAsync()...")
                         prepareAsync()
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error setting up MediaPlayer: ${e.message}", e)
+                    Log.e(TAG, "❌ Error setting up MediaPlayer: ${e.message}", e)
                     onVideoError?.invoke(e)
                 }
             }
             
-            isInitialized = true
+            // Already set isInitialized = true above to show green plane immediately
             return true
             
         } catch (e: Exception) {
@@ -311,39 +335,80 @@ class ArVideoRenderer(private val context: Context) {
      * Draw video quad lên AR scene
      */
     fun draw(viewMatrix: FloatArray, projectionMatrix: FloatArray) {
-        if (!isInitialized || anchor == null || !isPlaying) {
+        // Debug every frame for first 100 frames
+        if (frameCount < 100) {
+            Log.d(TAG, "🖼️ draw() called - frame #$frameCount, anchor: ${anchor != null}, tracking: ${anchor?.trackingState}")
+        }
+        
+        // Always try to draw if we have an anchor (for debug)
+        if (anchor == null) {
+            if (frameCount % 60 == 0) {
+                Log.w(TAG, "❌ No anchor!")
+            }
             return
         }
         
         // Check anchor tracking state
         if (anchor?.trackingState != TrackingState.TRACKING) {
+            // Log once
+            if (frameCount % 60 == 0) {
+                Log.w(TAG, "⚠️ Anchor not tracking: ${anchor?.trackingState}")
+            }
             return
         }
         
-        // Update texture from video
-        try {
-            surfaceTexture?.updateTexImage()
-        } catch (e: Exception) {
-            // Texture not ready yet
+        frameCount++
+        
+        // Update texture from video (only if video is playing)
+        if (isPlaying) {
+            try {
+                surfaceTexture?.updateTexImage()
+            } catch (e: Exception) {
+                // Texture not ready yet - but still render debug color
+            }
+        }
+        
+        // Validate shader program before use
+        if (shaderProgram == 0) {
+            if (frameCount % 60 == 0) {
+                Log.e(TAG, "❌ No shader program!")
+            }
             return
+        }
+        
+        // Debug log every 30 frames (about 0.5 second)
+        if (frameCount % 30 == 0) {
+            Log.d(TAG, "🎥 Frame #$frameCount - Playing: $isPlaying, Init: $isInitialized, GL: $glResourcesInitialized")
+        }
+        
+        // First frame special log
+        if (frameCount == 1) {
+            Log.i(TAG, "🎬🎬🎬 FIRST FRAME RENDERING! This should show green plane!")
         }
         
         // Use shader program
         GLES20.glUseProgram(shaderProgram)
-        checkGlError("glUseProgram")
         
-        // Enable blending for transparency
+        // DISABLE depth test and depth write completely - render on top of everything
+        GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+        GLES20.glDepthMask(false)
+        
+        // Enable blending with full alpha
         GLES20.glEnable(GLES20.GL_BLEND)
-        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+        GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+        
+        // Disable face culling to show both sides
+        GLES20.glDisable(GLES20.GL_CULL_FACE)
         
         // Calculate model matrix from anchor pose
         val modelMatrix = FloatArray(16)
         anchor?.pose?.toMatrix(modelMatrix, 0)
         
-        // Scale to video dimensions
+        // Scale to video dimensions (HUGE for testing - 1m x 1m)
         val scaleMatrix = FloatArray(16)
         Matrix.setIdentityM(scaleMatrix, 0)
-        Matrix.scaleM(scaleMatrix, 0, videoWidth, 1f, videoHeight)
+        // Make it MASSIVE so we can't miss it!
+        Matrix.scaleM(scaleMatrix, 0, 1.0f, 1.0f, 1.0f)
         
         // Rotate to face up (ARCore anchors are oriented differently)
         val rotationMatrix = FloatArray(16)
@@ -363,6 +428,9 @@ class ArVideoRenderer(private val context: Context) {
         
         // Set MVP matrix uniform
         GLES20.glUniformMatrix4fv(modelViewProjectionUniform, 1, false, mvpMatrix, 0)
+        
+        // Set video ready uniform (1.0 if playing, 0.0 for debug green)
+        GLES20.glUniform1f(videoReadyUniform, if (isPlaying && isInitialized) 1.0f else 0.0f)
         
         // Bind texture
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
@@ -393,10 +461,26 @@ class ArVideoRenderer(private val context: Context) {
         // Draw quad
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         
+        // Check for GL errors
+        val error = GLES20.glGetError()
+        if (error != GLES20.GL_NO_ERROR) {
+            Log.e(TAG, "❌❌❌ OpenGL Error after draw: $error")
+        }
+        
+        // Log first few draws
+        if (frameCount <= 10) {
+            Log.i(TAG, "✅ glDrawArrays called! Frame: $frameCount, VideoReady: ${if (isPlaying && isInitialized) 1.0f else 0.0f}")
+            Log.i(TAG, "📐 MVP Matrix: ${mvpMatrix.take(4).joinToString()}")
+            Log.i(TAG, "📍 Anchor Pose: ${anchor?.pose?.let { "tx=${it.tx()}, ty=${it.ty()}, tz=${it.tz()}" }}")
+        }
+        
         // Cleanup
         GLES20.glDisableVertexAttribArray(positionAttribute)
         GLES20.glDisableVertexAttribArray(texCoordAttribute)
         GLES20.glDisable(GLES20.GL_BLEND)
+        GLES20.glEnable(GLES20.GL_DEPTH_TEST) // Re-enable depth test
+        GLES20.glDepthMask(true) // Re-enable depth write
+        GLES20.glEnable(GLES20.GL_CULL_FACE) // Re-enable culling
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
     }
     
@@ -408,11 +492,9 @@ class ArVideoRenderer(private val context: Context) {
             if (it.isPlaying) {
                 it.pause()
                 isPlaying = false
-                Log.d(TAG, "Video paused")
             } else {
                 it.start()
                 isPlaying = true
-                Log.d(TAG, "Video resumed")
             }
         }
     }
@@ -426,8 +508,6 @@ class ArVideoRenderer(private val context: Context) {
      * Cleanup resources
      */
     fun cleanup() {
-        Log.d(TAG, "Cleaning up resources")
-        
         mainThreadHandler.post {
             mediaPlayer?.let {
                 try {
