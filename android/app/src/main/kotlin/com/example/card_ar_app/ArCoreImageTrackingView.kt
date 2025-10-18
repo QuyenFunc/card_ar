@@ -10,6 +10,7 @@ import android.opengl.GLSurfaceView
 import android.util.Log
 import android.view.Surface
 import android.view.View
+import kotlinx.coroutines.launch
 import com.google.ar.core.Anchor
 import com.google.ar.core.AugmentedImage
 import com.google.ar.core.AugmentedImageDatabase
@@ -60,14 +61,8 @@ class ArCoreImageTrackingView(
     // Reference images database
     private val referenceImageBytes = mutableMapOf<String, ByteArray>()
     
-    // Video rendering with raw OpenGL (ArVideoRenderer)
-    private val videoRenderers = mutableMapOf<String, ArVideoRenderer>()
-    
-    // Pending videos waiting for GL initialization
-    private data class PendingVideo(val imageId: String, val videoPath: String, val anchor: Anchor)
-    private val pendingVideos = mutableListOf<PendingVideo>()
-    
-    private var isGlInitialized = false
+    // Video rendering with Sceneform (ArVideoManager) - PROPER WAY
+    private val videoManagers = mutableMapOf<String, ArVideoManager>()
     
     init {
         methodChannel.setMethodCallHandler(this)
@@ -136,8 +131,8 @@ class ArCoreImageTrackingView(
                     }
                 }
                 
-                    // Render videos after processing frame
-                    renderVideos()
+                    // Update video textures (Sceneform handles rendering)
+                    updateVideoTextures()
                 } catch (e: Exception) {
                     // Silent error to avoid spam
                     if (System.currentTimeMillis() % 5000 < 100) {
@@ -153,59 +148,13 @@ class ArCoreImageTrackingView(
     }
     
     /**
-     * Render tất cả videos với OpenGL trong AR frame update
-     * This is called from the GL rendering thread
+     * Update video textures - Now handled by Node.addOnUpdateListener in ArVideoManager
+     * This method kept for monitoring purposes
      */
-    private fun renderVideos() {
-        try {
-            val frame = arSceneView?.arFrame ?: return
-            
-            // Initialize GL resources once on first render
-            if (!isGlInitialized) {
-                Log.i(TAG, "⚙️ GL thread ready - initializing resources...")
-                isGlInitialized = true
-            }
-            
-            // Process pending videos (that were waiting for GL to be ready)
-            synchronized(pendingVideos) {
-                if (pendingVideos.isNotEmpty()) {
-                    Log.i(TAG, "📦 Processing ${pendingVideos.size} pending videos...")
-                    val videosToProcess = pendingVideos.toList()
-                    pendingVideos.clear()
-                    
-                    for (pending in videosToProcess) {
-                        Log.i(TAG, "▶️ Initializing renderer for ${pending.imageId}")
-                        initializeVideoRenderer(pending.imageId, pending.videoPath, pending.anchor)
-                    }
-                }
-            }
-            
-            // Only render if we have videos
-            if (videoRenderers.isEmpty()) {
-                return
-            }
-            
-            val viewMatrix = FloatArray(16)
-            val projectionMatrix = FloatArray(16)
-            frame.camera.getViewMatrix(viewMatrix, 0)
-            frame.camera.getProjectionMatrix(projectionMatrix, 0, 0.1f, 100f)
-            
-            // Debug log để verify rendering
-            if (System.currentTimeMillis() % 1000 < 50) {
-                Log.d(TAG, "🎨 Rendering ${videoRenderers.size} video(s)")
-            }
-            
-            // Render all active videos
-            for ((imageId, renderer) in videoRenderers) {
-                try {
-                    renderer.draw(viewMatrix, projectionMatrix)
-                } catch (e: Exception) {
-                    Log.e(TAG, "❌ Render error for $imageId: ${e.message}")
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ renderVideos error: ${e.message}", e)
-        }
+    private fun updateVideoTextures() {
+        // Video texture updates are now handled automatically by each Node's update listener
+        // in ArVideoManager.attachToAnchorNode() which runs on the render thread
+        // No action needed here
     }
     
     private fun onImageDetected(augmentedImage: AugmentedImage) {
@@ -360,7 +309,7 @@ class ArCoreImageTrackingView(
             "pauseVideo" -> {
                 val imageId = call.argument<String>("imageId")
                 if (imageId != null) {
-                    videoRenderers[imageId]?.togglePlayPause()
+                    videoManagers[imageId]?.togglePlayPause()
                     result.success(true)
                 } else {
                     result.error("INVALID_ARGS", "Missing imageId", null)
@@ -412,13 +361,11 @@ class ArCoreImageTrackingView(
             }
             
             Log.i(TAG, "⚓ Anchor state: ${anchor.trackingState}")
+            Log.i(TAG, "🎬 Initializing video with Sceneform (PROPER WAY): $imageId")
 
-            Log.i(TAG, "🎬 Preparing video with ArVideoRenderer: $imageId")
-
-            // Add to pending list - will be initialized on next render cycle when GL is ready
-            synchronized(pendingVideos) {
-                pendingVideos.add(PendingVideo(imageId, videoPath, anchor))
-                Log.i(TAG, "📋 Video queued (${pendingVideos.size} pending)")
+            // Initialize video using coroutine (ArVideoManager uses suspend)
+            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+                initializeVideoWithSceneform(imageId, videoPath, anchorNode, anchor)
             }
 
         } catch (e: Exception) {
@@ -427,87 +374,62 @@ class ArCoreImageTrackingView(
     }
     
     /**
-     * Initialize video renderer - called from GL thread in renderVideos()
+     * Initialize video using Sceneform (PROPER WAY)
      */
-    private fun initializeVideoRenderer(imageId: String, videoPath: String, anchor: Anchor) {
-        Log.i(TAG, "🔧 initializeVideoRenderer START for $imageId")
+    private suspend fun initializeVideoWithSceneform(imageId: String, videoPath: String, anchorNode: AnchorNode, anchor: Anchor) {
+        Log.i(TAG, "🔧 initializeVideoWithSceneform START for $imageId")
         
         try {
             // Check if already exists
-            if (videoRenderers.containsKey(imageId)) {
-                Log.w(TAG, "⚠️ Video renderer already exists for $imageId")
+            if (videoManagers.containsKey(imageId)) {
+                Log.w(TAG, "⚠️ Video manager already exists for $imageId")
                 return
             }
             
-            // Create custom OpenGL video renderer
-            val videoRenderer = ArVideoRenderer(context)
-            Log.i(TAG, "✓ ArVideoRenderer instance created")
+            // Create ArVideoManager
+            val videoManager = ArVideoManager(context)
+            videoManagers[imageId] = videoManager
+            Log.i(TAG, "✓ ArVideoManager created for $imageId")
             
-            // Initialize GL resources (we're on GL thread now)
-            videoRenderer.initializeGl()
-            Log.i(TAG, "✓ GL resources initialized for $imageId")
-            
-            // Add to map after GL init succeeds
-            videoRenderers[imageId] = videoRenderer
-            Log.i(TAG, "✓ Renderer added to map (${videoRenderers.size} total)")
-
-            // Initialize video on main thread (MediaPlayer requires main thread)
-            activity.runOnUiThread {
-                try {
-                    Log.i(TAG, "🎬 Starting video initialization on main thread...")
-                    
-                    // Get renderer from map
-                    val renderer = videoRenderers[imageId]
-                    if (renderer == null) {
-                        Log.e(TAG, "❌ Renderer not found in map!")
-                        return@runOnUiThread
+            // Initialize video at anchor
+            val success = videoManager.initializeVideoAtAnchor(
+                videoPath = videoPath,
+                anchor = anchor,
+                width = 0.2f, // 20cm width
+                anchorNode = anchorNode,
+                onReady = {
+                    Log.i(TAG, "✅ ✅ ✅ Video ready and playing: $imageId")
+                    // Notify Flutter
+                    activity.runOnUiThread {
+                        methodChannel.invokeMethod("onVideoStarted", mapOf(
+                            "imageId" to imageId
+                        ))
                     }
-                    
-                    Log.i(TAG, "📹 Calling initializeVideo with path: $videoPath")
-                    val success = renderer.initializeVideo(
-                        videoPath,
-                        anchor,
-                        0.2f,  // 20cm width
-                        onVideoPrepared = {
-                            Log.i(TAG, "✅ ✅ ✅ Video ready and playing: $imageId")
-                            // Notify Flutter
-                            methodChannel.invokeMethod("onVideoStarted", mapOf(
-                                "imageId" to imageId
-                            ))
-                        },
-                        onVideoError = { error: Throwable ->
-                            Log.e(TAG, "❌ Video error: ${error.message}", error)
-                            videoRenderers.remove(imageId)
-                        }
-                    )
-
-                    if (!success) {
-                        Log.e(TAG, "❌ initializeVideo returned false")
-                        videoRenderers.remove(imageId)
-                    } else {
-                        Log.i(TAG, "✓ initializeVideo returned true")
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "❌ Error initializing video: ${e.message}", e)
-                    videoRenderers.remove(imageId)
                 }
+            )
+            
+            if (!success) {
+                Log.e(TAG, "❌ Failed to initialize video")
+                videoManagers.remove(imageId)
+            } else {
+                Log.i(TAG, "✓ Video initialized successfully for $imageId")
             }
-
+            
         } catch (e: Exception) {
-            Log.e(TAG, "❌ Fatal error initializing renderer: ${e.message}", e)
-            videoRenderers.remove(imageId)
+            Log.e(TAG, "❌ Fatal error initializing video: ${e.message}", e)
+            videoManagers.remove(imageId)
         }
     }
     
     private fun stopVideoForImage(imageId: String) {
-        videoRenderers[imageId]?.let { renderer ->
+        videoManagers[imageId]?.let { manager ->
             try {
-                renderer.cleanup()
+                manager.cleanup()
             } catch (e: Exception) {
                 Log.e(TAG, "Error cleaning up: ${e.message}")
             }
         }
-        videoRenderers.remove(imageId)
+        videoManagers.remove(imageId)
     }
     
     private fun setupAugmentedImagesDatabase() {
@@ -545,8 +467,8 @@ class ArCoreImageTrackingView(
     override fun dispose() {
         onPause()
         
-        // Cleanup all videos
-        val imageIds = videoRenderers.keys.toList()
+        // Cleanup all videos using ArVideoManager
+        val imageIds = videoManagers.keys.toList()
         for (imageId in imageIds) {
             stopVideoForImage(imageId)
         }

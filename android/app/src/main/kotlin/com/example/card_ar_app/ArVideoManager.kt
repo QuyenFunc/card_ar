@@ -6,6 +6,7 @@ import android.media.MediaPlayer
 import android.net.Uri
 import android.util.Log
 import android.view.Surface
+import java.io.File
 import com.google.ar.core.Anchor
 import com.google.ar.core.Frame
 import com.google.ar.core.Plane
@@ -17,8 +18,12 @@ import com.google.ar.sceneform.math.Quaternion
 import com.google.ar.sceneform.math.Vector3
 import com.google.ar.sceneform.rendering.ExternalTexture
 import com.google.ar.sceneform.rendering.Material
+import com.google.ar.sceneform.rendering.MaterialFactory
 import com.google.ar.sceneform.rendering.ModelRenderable
 import com.google.ar.sceneform.rendering.Renderable
+import com.google.ar.sceneform.rendering.Texture
+import com.google.ar.sceneform.rendering.ShapeFactory
+import com.google.ar.sceneform.rendering.Color
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -76,16 +81,81 @@ class ArVideoManager(private val context: Context) {
             videoAnchor = anchor
             
             // Create ExternalTexture
+            // Sceneform will automatically update this texture on the render thread
+            // We don't need to call updateTexImage() manually!
             externalTexture = ExternalTexture().apply {
-                Log.d(TAG, "ExternalTexture created")
+                Log.d(TAG, "ExternalTexture created - Sceneform will auto-update")
             }
             
             // Create MediaPlayer
             mediaPlayer = MediaPlayer().apply {
                 try {
-                    // Load video from assets or file path
-                    val videoUri = if (videoPath.startsWith("assets://")) {
-                        // Load from assets
+                    // Load video from Flutter assets or file path
+                    if (videoPath.startsWith("assets/")) {
+                        // Load from Flutter assets - extract to temp file first
+                        // Flutter compiles all assets into "flutter_assets" folder
+                        Log.d(TAG, "Loading Flutter asset: $videoPath")
+                        
+                        try {
+                            val assetManager = context.assets
+                            
+                            // Debug: List available assets to see what's actually there
+                            try {
+                                val assets = assetManager.list("flutter_assets") ?: emptyArray()
+                                Log.d(TAG, "Available flutter_assets: ${assets.take(10).joinToString(", ")}")
+                                
+                                val videoAssets = assetManager.list("flutter_assets/videos") ?: emptyArray()
+                                Log.d(TAG, "Available video assets: ${videoAssets.joinToString(", ")}")
+                            } catch (listE: Exception) {
+                                Log.w(TAG, "Could not list assets: ${listE.message}")
+                            }
+                            
+                            // Flutter assets are in "flutter_assets" folder
+                            val flutterAssetPath = "flutter_assets/$videoPath"
+                            Log.d(TAG, "Trying Flutter asset path: $flutterAssetPath")
+                            
+                            val inputStream = assetManager.open(flutterAssetPath)
+                            
+                            // Create temporary file
+                            val tempFile = File(context.cacheDir, "temp_video_${System.currentTimeMillis()}.mp4")
+                            tempFile.outputStream().use { output ->
+                                inputStream.copyTo(output)
+                            }
+                            inputStream.close()
+                            
+                            setDataSource(tempFile.absolutePath)
+                            Log.d(TAG, "✓ Video extracted to temp file: ${tempFile.absolutePath}")
+                            
+                            // Schedule cleanup of temp file after use
+                            tempFile.deleteOnExit()
+                        } catch (e: Exception) {
+                            Log.e(TAG, "❌ Failed to extract Flutter asset '$videoPath': ${e.message}", e)
+                            
+                            // Try without "assets/" prefix in flutter_assets folder
+                            try {
+                                val pathWithoutAssets = videoPath.substring(7) // Remove "assets/"
+                                val flutterAssetPath = "flutter_assets/$pathWithoutAssets"
+                                Log.d(TAG, "Trying alternative Flutter path: $flutterAssetPath")
+                                
+                                val assetManager = context.assets
+                                val inputStream = assetManager.open(flutterAssetPath)
+                                
+                                val tempFile = File(context.cacheDir, "temp_video_${System.currentTimeMillis()}.mp4")
+                                tempFile.outputStream().use { output ->
+                                    inputStream.copyTo(output)
+                                }
+                                inputStream.close()
+                                
+                                setDataSource(tempFile.absolutePath)
+                                Log.d(TAG, "✓ Video extracted using alternative path: ${tempFile.absolutePath}")
+                                tempFile.deleteOnExit()
+                            } catch (altE: Exception) {
+                                Log.e(TAG, "❌ Alternative path also failed: ${altE.message}", altE)
+                                throw e
+                            }
+                        }
+                    } else if (videoPath.startsWith("assets://")) {
+                        // Load from Android assets
                         val assetPath = videoPath.substring(9) // Remove "assets://"
                         val afd = context.assets.openFd(assetPath)
                         setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
@@ -166,7 +236,7 @@ class ArVideoManager(private val context: Context) {
     
     /**
      * Tạo Renderable cho video plane với ExternalTexture
-     * Sử dụng ModelRenderable với custom material
+     * Sử dụng Material.builder() để tạo material tương thích với ExternalTexture
      */
     private suspend fun createVideoRenderable(
         width: Float,
@@ -174,64 +244,198 @@ class ArVideoManager(private val context: Context) {
         anchorNode: AnchorNode?,
         onReady: (() -> Unit)?
     ) = withContext(Dispatchers.Main) {
+        val height = width / aspectRatio
+        val extTexture = externalTexture ?: run {
+            Log.e(TAG, "ExternalTexture is null")
+            return@withContext
+        }
+
         try {
-            val height = width / aspectRatio
-            val texture = externalTexture ?: run {
-                Log.e(TAG, "ExternalTexture is null")
+            Log.d(TAG, "Creating video renderable: ${width}m x ${height}m")
+
+            // Load the sceneform_opaque_textured_material.matc which supports ExternalTexture
+            val resourceId = context.resources.getIdentifier(
+                "sceneform_opaque_textured_material",
+                "raw",
+                context.packageName
+            )
+            
+            if (resourceId == 0) {
+                Log.e(TAG, "❌ Could not find sceneform_opaque_textured_material in resources")
+                createMaterialWithExternalTexture(width, height, anchorNode, onReady)
                 return@withContext
             }
             
-            Log.d(TAG, "Creating video renderable: ${width}m x ${height}m")
-            
-            // Build material directly with ExternalTexture
+            Log.d(TAG, "Loading material from resource ID: $resourceId")
+
+            // Create material using the .matc file which properly supports ExternalTexture
             Material.builder()
-                .setSource(context, android.net.Uri.parse("materials/video_material.mat"))
+                .setSource(context, resourceId)
                 .build()
-                .thenAccept { material ->
-                    // Set external texture to material
-                    material.setExternalTexture("videoTexture", texture)
-                    this@ArVideoManager.videoMaterial = material
-                    Log.d(TAG, "✓ Material created with external texture")
-                    
-                    // Create simple plane renderable
-                    val halfWidth = width / 2f
-                    val halfHeight = height / 2f
-                    
-                    // Build a simple quad renderable
-                    ModelRenderable.builder()
-                        .setSource(context, android.net.Uri.parse("models/plane.sfb"))
-                        .build()
-                        .thenAccept { renderable ->
-                            renderable.material = material
-                            videoRenderable = renderable
-                            Log.d(TAG, "✓ Video renderable created: ${width}m x ${height}m")
-                            
-                            // Attach to anchor node if provided
-                            anchorNode?.let { node ->
-                                attachToAnchorNode(node)
+                .thenAccept { material: Material ->
+                    try {
+                        // Set the ExternalTexture as the "texture" parameter (standard in Sceneform materials)
+                        // Try different parameter names - Sceneform materials may use different names
+                        try {
+                            material.setExternalTexture("texture", extTexture)
+                            Log.d(TAG, "✓ ExternalTexture set with parameter name: 'texture'")
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Failed with 'texture', trying 'videoTexture': ${e.message}")
+                            try {
+                                material.setExternalTexture("videoTexture", extTexture)
+                                Log.d(TAG, "✓ ExternalTexture set with parameter name: 'videoTexture'")
+                            } catch (e2: Exception) {
+                                Log.w(TAG, "Failed with 'videoTexture', trying 'baseColorMap': ${e2.message}")
+                                material.setExternalTexture("baseColorMap", extTexture)
+                                Log.d(TAG, "✓ ExternalTexture set with parameter name: 'baseColorMap'")
                             }
-                            
-                            // Notify ready
-                            onReady?.invoke()
                         }
-                        .exceptionally { error ->
-                            Log.e(TAG, "Failed to create renderable: ${error?.message}", error)
-                            null
+                        
+                        this@ArVideoManager.videoMaterial = material
+                        Log.d(TAG, "✓ Material created with ExternalTexture using .matc file")
+
+                        val renderable = ShapeFactory.makeCube(
+                            Vector3(width, 0.001f, height),
+                            Vector3.zero(),
+                            material
+                        )
+
+                        videoRenderable = renderable
+                        Log.d(TAG, "✓ Video plane created: ${width}m x ${height}m")
+
+                        anchorNode?.let { node ->
+                            attachToAnchorNode(node)
                         }
+
+                        onReady?.invoke()
+
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error creating renderable: ${e.message}", e)
+                        createFallbackRenderable(width, height, anchorNode, onReady)
+                    }
                 }
-                .exceptionally { error ->
-                    Log.e(TAG, "Failed to create material: ${error?.message}", error)
+                .exceptionally { error: Throwable? ->
+                    Log.e(TAG, "Failed to create material from .matc: ${error?.message ?: "Unknown error"}", error)
+                    // Try alternative approach with color material + external texture
+                    createMaterialWithExternalTexture(width, height, anchorNode, onReady)
                     null
                 }
-            
+
         } catch (e: Exception) {
             Log.e(TAG, "Error creating video renderable: ${e.message}", e)
+            createFallbackRenderable(width, height, anchorNode, onReady)
         }
     }
     
     /**
+     * Alternative approach: Create a base material and set ExternalTexture as parameter
+     */
+    private fun createMaterialWithExternalTexture(
+        width: Float,
+        height: Float,
+        anchorNode: AnchorNode?,
+        onReady: (() -> Unit)?
+    ) {
+        try {
+            Log.i(TAG, "🔄 Trying alternative material creation with ExternalTexture")
+            
+            val extTexture = externalTexture ?: run {
+                Log.e(TAG, "ExternalTexture is null in alternative approach")
+                createFallbackRenderable(width, height, anchorNode, onReady)
+                return
+            }
+            
+            // Create a base opaque color material first
+            val color = com.google.ar.sceneform.rendering.Color(1f, 1f, 1f, 1f) // White
+            
+            MaterialFactory.makeOpaqueWithColor(context, color)
+                .thenAccept { material: Material ->
+                    try {
+                        // Try to set ExternalTexture as a parameter (using standard "texture" param name)
+                        material.setExternalTexture("texture", extTexture)
+                        
+                        videoMaterial = material
+                        Log.d(TAG, "✓ Material created with ExternalTexture (alternative approach)")
+                        
+                        // Create plane
+                        videoRenderable = com.google.ar.sceneform.rendering.ShapeFactory.makeCube(
+                            Vector3(width, 0.001f, height),
+                            Vector3.zero(),
+                            material
+                        )
+                        
+                        Log.i(TAG, "✅ Video plane created with external texture")
+                        
+                        anchorNode?.let { node ->
+                            attachToAnchorNode(node)
+                        }
+                        
+                        onReady?.invoke()
+                        
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to set ExternalTexture parameter: ${e.message}", e)
+                        createFallbackRenderable(width, height, anchorNode, onReady)
+                    }
+                }
+                .exceptionally { error: Throwable? ->
+                    Log.e(TAG, "Alternative approach failed: ${error?.message ?: error.toString()}")
+                    createFallbackRenderable(width, height, anchorNode, onReady)
+                    null
+                }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in alternative approach: ${e.message}", e)
+            createFallbackRenderable(width, height, anchorNode, onReady)
+        }
+    }
+    
+    /**
+     * Fallback: Create plane with default material (for testing)
+     */
+    private fun createFallbackRenderable(
+        width: Float,
+        height: Float,
+        anchorNode: AnchorNode?,
+        onReady: (() -> Unit)?
+    ) {
+        try {
+            Log.i(TAG, "🔄 Using fallback - creating simple plane renderable")
+            
+            // Create a simple unlit material programmatically
+            val color = com.google.ar.sceneform.rendering.Color(0f, 1f, 0f, 1f) // Green for debugging
+            
+            MaterialFactory.makeOpaqueWithColor(context, color)
+                .thenAccept { material: Material ->
+                    videoMaterial = material
+                    
+                    // Create plane
+                    videoRenderable = com.google.ar.sceneform.rendering.ShapeFactory.makeCube(
+                        Vector3(width, 0.001f, height),
+                        Vector3.zero(),
+                        material
+                    )
+                    
+                    Log.i(TAG, "✅ Fallback plane created (should show green)")
+                    
+                    anchorNode?.let { node ->
+                        attachToAnchorNode(node)
+                    }
+                    
+                    onReady?.invoke()
+                }
+                .exceptionally { error: Throwable? ->
+                    Log.e(TAG, "Fallback also failed: ${error?.message ?: error.toString()}")
+                    null
+                }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in fallback: ${e.message}", e)
+        }
+    }
+    
+    
+    /**
      * Render video lên AR scene
      * Gọi method này trong onDrawFrame của AR session
+     * NOTE: This must be called from the rendering thread (Sceneform's update listener)
      */
     fun render(frame: Frame) {
         if (!isInitialized || videoRenderable == null || videoAnchor == null) {
@@ -240,16 +444,9 @@ class ArVideoManager(private val context: Context) {
         
         // Check if anchor is still tracking
         if (videoAnchor?.trackingState != TrackingState.TRACKING) {
-            Log.w(TAG, "Anchor not tracking: ${videoAnchor?.trackingState}")
+            // Don't log every frame to avoid spam
             return
         }
-        
-        // Update ExternalTexture
-        externalTexture?.surfaceTexture?.updateTexImage()
-        
-        // Render the video plane at anchor position
-        // Note: Actual rendering will be handled by Sceneform's rendering pipeline
-        // This is just to update the texture
     }
     
     /**
@@ -326,10 +523,12 @@ class ArVideoManager(private val context: Context) {
                     setParent(anchorNode)
                     this.renderable = renderable
                     
-                    // Rotate video to face up (adjust based on your needs)
-                    localRotation = Quaternion.axisAngle(Vector3(1f, 0f, 0f), 90f)
+                    // No rotation - video plane will be parallel to the detected card image
+                    // The anchor already has the correct orientation from ARCore image tracking
+                    // If you need to flip or rotate, adjust here:
+                    // localRotation = Quaternion.axisAngle(Vector3(1f, 0f, 0f), 180f) // flip
                     
-                    Log.d(TAG, "✓ Video node attached to anchor")
+                    Log.d(TAG, "✓ Video node attached to anchor (no rotation applied)")
                 }
             }
         } catch (e: Exception) {
