@@ -349,70 +349,87 @@ class ArCoreImageTrackingView(
                 Log.e(TAG, "❌ No anchor node found for image: $imageId")
                 return
             }
-            
+
             // Get anchor from node
             val anchor = (anchorNode as? AnchorNode)?.anchor
             if (anchor == null) {
                 Log.e(TAG, "❌ No anchor found in anchor node")
                 return
             }
-            
+
             Log.i(TAG, "========================================")
             Log.i(TAG, "🎬 Starting video playback for: $imageId")
             Log.i(TAG, "📹 Video path: $videoPath")
             Log.i(TAG, "⚓ Anchor: $anchor")
-            
+
             // Create custom OpenGL video renderer
             val videoRenderer = ArVideoRenderer(context)
             videoRenderers[imageId] = videoRenderer
-            
-            try {
-                // Initialize GL resources
-                videoRenderer.initializeGl()
-                Log.d(TAG, "✓ OpenGL initialized")
-                
-                // Initialize video (MediaPlayer setup happens on main thread internally)
-                val success = videoRenderer.initializeVideo(
-                    videoPath,
-                    anchor,
-                    0.15f,
-                    onVideoPrepared = {
-                        Log.i(TAG, "========================================")
-                        Log.i(TAG, "🎉 SUCCESS! Video renderer initialized for $imageId")
-                        Log.i(TAG, "========================================")
-                    },
-                    onVideoError = { error ->
-                        Log.e(TAG, "❌ Video initialization error: ${error.message}", error)
-                        videoRenderers.remove(imageId)
+
+            val sceneView = arSceneView
+            if (sceneView == null) {
+                Log.e(TAG, "❌ ARSceneView is null, cannot initialize renderer")
+                videoRenderers.remove(imageId)
+                return
+            }
+
+            sceneView.queueEvent {
+                try {
+                    // Initialize GL resources on the GL thread
+                    videoRenderer.initializeGl()
+                    Log.d(TAG, "✓ OpenGL initialized on GL thread")
+
+                    activity.runOnUiThread {
+                        try {
+                            // Initialize video (MediaPlayer setup happens on main thread internally)
+                            val success = videoRenderer.initializeVideo(
+                                videoPath,
+                                anchor,
+                                0.15f,
+                                onVideoPrepared = {
+                                    Log.i(TAG, "========================================")
+                                    Log.i(TAG, "🎉 SUCCESS! Video renderer initialized for $imageId")
+                                    Log.i(TAG, "========================================")
+                                },
+                                onVideoError = { error ->
+                                    Log.e(TAG, "❌ Video initialization error: ${error.message}", error)
+                                    videoRenderers.remove(imageId)
+                                }
+                            )
+
+                            if (!success) {
+                                Log.e(TAG, "❌ Failed to initialize video renderer")
+                                videoRenderers.remove(imageId)
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "❌ Error initializing video on UI thread: ${e.message}", e)
+                            videoRenderers.remove(imageId)
+                        }
                     }
-                )
-                
-                if (!success) {
-                    Log.e(TAG, "❌ Failed to initialize video renderer")
+                } catch (e: Exception) {
+                    Log.e(TAG, "❌ Error initializing video on GL thread: ${e.message}", e)
                     videoRenderers.remove(imageId)
                 }
-                
-            } catch (e: Exception) {
-                Log.e(TAG, "❌ Error initializing video: ${e.message}", e)
-                videoRenderers.remove(imageId)
             }
-            
+
         } catch (e: Exception) {
             Log.e(TAG, "❌ Fatal error in playVideoForImage: ${e.message}", e)
         }
     }
-    
+
     private fun stopVideoForImage(imageId: String) {
         // Cleanup video renderer
-        videoRenderers[imageId]?.let {
-            try {
-                it.cleanup()
-            } catch (e: Exception) {
-                Log.e(TAG, "Error cleaning up video renderer: ${e.message}")
+        videoRenderers[imageId]?.let { renderer ->
+            arSceneView?.queueEvent {
+                try {
+                    renderer.cleanup()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error cleaning up video renderer: ${e.message}")
+                }
             }
         }
         videoRenderers.remove(imageId)
-        
+
         Log.i(TAG, "✓ Stopped video for $imageId")
     }
     
